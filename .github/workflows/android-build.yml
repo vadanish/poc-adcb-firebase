@@ -31,7 +31,16 @@ jobs:
         run: |
           gem install bundler
           bundle install
-          
+
+      - name: Restore Firebase Service Account
+        run: |
+          echo '${{ secrets.FIREBASE_CREDENTIALS }}' > firebase-service-account.json
+
+      - name: Build and Upload to Firebase App Distribution
+        run: bundle exec fastlane android firebase_distribution
+        env:
+          FIREBASE_APP_ID: ${{ secrets.FIREBASE_APP_ID }}
+
       - name: Verify APK Exists
         run: |
           echo "Checking APK..."
@@ -43,21 +52,9 @@ jobs:
             echo "APK NOT FOUND"
             exit 1
           fi
-          
+
       - name: Upload APK Artifact to GitHub
         uses: actions/upload-artifact@v4
         with:
           name: app-debug-apk
           path: app/build/outputs/apk/debug/app-debug.apk
-          
-      - name: Restore Firebase Service Account
-        run: |
-          echo '${{ secrets.FIREBASE_CREDENTIALS }}' > firebase-service-account.json
-
-      - name: Build and Upload to Firebase App Distribution
-        run: bundle exec fastlane android firebase_distribution
-        env:
-          FIREBASE_APP_ID: ${{ secrets.FIREBASE_APP_ID }}
-
-
-
