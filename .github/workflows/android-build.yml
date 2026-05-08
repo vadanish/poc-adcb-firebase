@@ -86,8 +86,8 @@ jobs:
       - name: Restore Firebase Service Account
         run: |
           echo '${{ secrets.FIREBASE_CREDENTIALS }}' > firebase-service-account.json
-
+          
       - name: Upload to Firebase App Distribution
-        run: bundle exec fastlane android upload_firebase
+        run: bundle exec fastlane android firebase_distribution
         env:
           FIREBASE_APP_ID: ${{ secrets.FIREBASE_APP_ID }}
