@@ -103,7 +103,9 @@ jobs:
         run: bundle exec fastlane android firebase_distribution
         env:
           FIREBASE_APP_ID: ${{ secrets.FIREBASE_APP_ID }}
+          FIREBASE_TESTERS: ${{ secrets.FIREBASE_TESTERS }}
           RELEASE_VERSION: ${{ env.NEW_TAG }}
+          GOOGLE_APPLICATION_CREDENTIALS: firebase-service-account.json
 
       - name: Commit Version Update
         if: success()
