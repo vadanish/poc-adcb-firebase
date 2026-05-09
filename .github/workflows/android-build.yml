@@ -21,9 +21,9 @@ jobs:
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
+          ref: main
 
       - name: Generate Next Version Tag
-        id: version
         run: |
           git fetch --tags
 
@@ -47,21 +47,17 @@ jobs:
             NEW_TAG="v${MAJOR}.${MINOR}.${PATCH}"
           fi
 
-          echo "New version tag: $NEW_TAG"
           echo "NEW_TAG=$NEW_TAG" >> $GITHUB_ENV
+          echo "New version tag: $NEW_TAG"
 
       - name: Update Android App Version
         run: |
           VERSION_NAME=${NEW_TAG#v}
           VERSION_CODE=${{ github.run_number }}
 
-          echo "Updating versionName to $VERSION_NAME"
-          echo "Updating versionCode to $VERSION_CODE"
-
           perl -i -pe "s/versionName = \".*\"/versionName = \"$VERSION_NAME\"/" app/build.gradle.kts
           perl -i -pe "s/versionCode = [0-9]+/versionCode = $VERSION_CODE/" app/build.gradle.kts
 
-          echo "Updated Android version:"
           grep -n "versionName\|versionCode" app/build.gradle.kts
 
       - name: Setup Java 17
@@ -78,15 +74,14 @@ jobs:
 
       - name: Verify APK Exists
         run: |
-          echo "Checking APK..."
           ls -lah app/build/outputs/apk/debug/
 
-          if [ -f app/build/outputs/apk/debug/app-debug.apk ]; then
-            echo "APK FOUND SUCCESSFULLY"
-          else
+          if [ ! -f app/build/outputs/apk/debug/app-debug.apk ]; then
             echo "APK NOT FOUND"
             exit 1
           fi
+
+          echo "APK FOUND SUCCESSFULLY"
 
       - name: Upload APK Artifact to GitHub
         uses: actions/upload-artifact@v4
@@ -98,11 +93,7 @@ jobs:
         uses: ruby/setup-ruby@v1
         with:
           ruby-version: 3.2
-
-      - name: Install Fastlane
-        run: |
-          gem install bundler
-          bundle install
+          bundler-cache: true
 
       - name: Restore Firebase Service Account
         run: |
@@ -114,11 +105,18 @@ jobs:
           FIREBASE_APP_ID: ${{ secrets.FIREBASE_APP_ID }}
           RELEASE_VERSION: ${{ env.NEW_TAG }}
 
-      - name: Create and Push Git Tag
+      - name: Commit Version Update
         if: success()
         run: |
           git config user.name "github-actions"
           git config user.email "github-actions@github.com"
 
+          git add app/build.gradle.kts
+          git commit -m "chore: release $NEW_TAG" || echo "No changes to commit"
+          git push origin main
+
+      - name: Create and Push Git Tag
+        if: success()
+        run: |
           git tag $NEW_TAG
           git push origin $NEW_TAG
