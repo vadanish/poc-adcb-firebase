@@ -1,0 +1,1337 @@
+name: Build React Native CI/CD
+run-name: ${{ inputs.Environment }} Build ${{ inputs.platform }} - ${{ inputs.AppVersion }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      platform:
+        description: "Choose platform to build"
+        required: true
+        default: "ANDROID"
+        type: choice
+        options:
+          - ANDROID
+          - IOS
+          - WEB
+      PublishOnStore:
+        description: "Deploy on mobile stores? (Play Store [Internal Track] / App Store [Testflight])"
+        required: true
+        default: false
+        type: boolean
+      AppVersion:
+        description: "Mobile/Web app version"
+        required: true
+        type: string
+      Environment:
+        description: "Environment for the build. (PROD deploys to Testflight and Play Store Internal track)"
+        required: true
+        default: 'SIT'
+        type: choice
+        options:
+          - 'SIT'
+          - 'UAT'
+          - 'PENTEST'
+          - 'PREPROD'
+          - 'PROD'
+          - 'PROD-Webserver'
+      AndroidRunner:
+        description: 'Choose the github-runner that you wish to run (Only for ANDROID).'
+        default: 'ubuntu-24.04-4-core'
+        type: choice
+        options:
+          - 'ubuntu-24.04-4-core'
+          - 'ubuntu-24.04'
+          - 'ubuntu-latest'
+      IosRunner:
+        description: 'Choose the github-runner that you wish to run (Only for IOS).'
+        default: 'macos-15'
+        type: choice
+        options:
+          - 'macos-15-xlarge'
+          - 'macos-15'
+          - 'macos-latest'
+      EnableIosTargetValidation:
+        description: 'Enable xcode project validation step for iOS build (Only for IOS). Recommended for non-PROD builds.'
+        default: true
+        type: boolean
+
+permissions:
+  actions: read
+  contents: read
+  security-events: write
+  checks: write
+  id-token: write
+  attestations: write
+  artifact-metadata: write
+
+jobs:
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# PRE-BUILD SECURITY SCANS
+# All four scan jobs run in parallel immediately on trigger.
+# Skipped entirely for SIT — SIT goes straight to build.
+# pre-build-security-gate collects results and blocks build if any fail.
+# ═══════════════════════════════════════════════════════════════════════════════
+
+  branch-check:
+    name: Branch check for UAT onwards
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check branch for UAT+ environments
+        run: |
+          ENV="${{ github.event.inputs.Environment }}"
+          BRANCH="${GITHUB_REF_NAME}"
+          if [[ "$ENV" != "SIT" ]]; then
+            if [[ ! "$BRANCH" =~ ^(main|release/dev|release/staging)$ ]]; then
+              echo "❌ Branch '$BRANCH' is NOT allowed for environment '$ENV'."
+              echo "✅ Allowed branches: main, release/dev, release/staging"
+              exit 1
+            else
+              echo "✅ Branch '$BRANCH' is allowed for environment '$ENV'."
+            fi
+          else
+            echo "ℹ️ Environment is SIT — skipping branch check."
+          fi
+  # ── CodeQL alert check + SonarQube quality gate ───────────────────────────
+  scan-codeql-sonar:
+    name: Security / CodeQL + SonarQube
+    runs-on: codebuild-mib2-frontend-deploy-runner-${{ github.run_id }}-${{ github.run_attempt }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install jq
+        run: |
+          curl -sL https://github.com/jqlang/jq/releases/latest/download/jq-linux-amd64 -o /usr/local/bin/jq
+          chmod +x /usr/local/bin/jq
+          jq --version
+      - name: Check CodeQL exception file
+        id: codeql_exception
+        run: |
+          set -euo pipefail
+          BRANCH_NAME="${GITHUB_REF_NAME}"
+          TODAY_UTC=$(date -u +"%Y-%m-%d")
+          EXCEPTION_FILE=".codeql-exceptions"
+          EXCEPTION_FOUND=false
+          EXCEPTION_EXPIRED=false
+          if [[ ! -f "$EXCEPTION_FILE" ]]; then
+            echo "No exception file found, proceeding normally"
+            echo "exception_found=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          while IFS='|' read -r exc_branch reason expires || [[ -n "$exc_branch" ]]; do
+            [[ "$exc_branch" =~ ^#.*$ || -z "$exc_branch" ]] && continue
+            exc_branch=$(echo "$exc_branch" | xargs)
+            reason=$(echo "$reason" | xargs)
+            expires=$(echo "$expires" | xargs)
+            [[ "$exc_branch" != "$BRANCH_NAME" ]] && continue
+            if [[ "$expires" < "$TODAY_UTC" ]]; then
+              echo "⚠️  Exception for '$BRANCH_NAME' expired on $expires — Reason: $reason"
+              EXCEPTION_EXPIRED=true
+              echo "exception_found=false" >> "$GITHUB_OUTPUT"
+              echo "exception_expired=true" >> "$GITHUB_OUTPUT"
+            else
+              echo "⚠️  Exception active for '$BRANCH_NAME' — Reason: $reason — Expires: $expires"
+              EXCEPTION_FOUND=true
+              echo "exception_found=true" >> "$GITHUB_OUTPUT"
+              echo "exception_expired=false" >> "$GITHUB_OUTPUT"
+            fi
+            break
+          done < "$EXCEPTION_FILE"
+          # If no matching branch was found in the file
+          if [[ "$EXCEPTION_FOUND" == "false" && "$EXCEPTION_EXPIRED" == "false" ]]; then
+            echo "exception_found=false" >> "$GITHUB_OUTPUT"
+            echo "exception_expired=false" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Fail on Medium or higher alerts
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const exceptionFound = '${{ steps.codeql_exception.outputs.exception_found }}' === 'true';
+            const exceptionExpired = '${{ steps.codeql_exception.outputs.exception_expired }}' === 'true';
+            if (exceptionFound) {
+              console.log('⚠️  Active exception found — Medium+ alerts will not fail the build');
+              return;
+            }
+            if (exceptionExpired) {
+              core.warning('⚠️  Exception file entry has expired — enforcing alert check');
+            }
+            const severities = ['critical', 'high', 'medium'];
+            let totalAlerts = 0;
+            const branchRef = context.ref.replace('refs/heads/', '');
+            for (const severity of severities) {
+              const { data: alerts } = await github.rest.codeScanning.listAlertsForRepo({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                ref: branchRef,
+                state: 'open',
+                severity,
+                tool_name: 'CodeQL'
+              });
+              totalAlerts += alerts.length;
+              console.log(`→ ${severity} severity: ${alerts.length} alert(s)`);
+            }
+            if (totalAlerts > 0) {
+              core.setFailed(`❌ Found ${totalAlerts} open alert(s) with Medium or higher severity on branch ${context.ref}`);
+            } else {
+              console.log('✅ No Medium, High, or Critical severity alerts found.');
+            }
+      - name: SonarQube quality gate with branch exception
+        id: quality_gate
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+          SONAR_HOST_URL: ${{ secrets.SONAR_HOST_URL }}
+        run: |
+          set -euo pipefail
+          BRANCH_NAME="${GITHUB_REF_NAME}"
+          PROJECT_KEY="mib-ui-yarn-monorepo"
+          TODAY_UTC=$(date -u +"%Y-%m-%d")
+          EXCEPTION_FILE=".sonar-gate-exceptions"
+          EXCEPTION_FOUND=false
+          EXCEPTION_EXPIRED=false
+          echo "Branch:      $BRANCH_NAME"
+          echo "Today (UTC): $TODAY_UTC"
+          while IFS='|' read -r exc_branch reason expires || [[ -n "$exc_branch" ]]; do
+            [[ "$exc_branch" =~ ^#.*$ || -z "$exc_branch" ]] && continue
+            exc_branch=$(echo "$exc_branch" | xargs)
+            expires=$(echo "$expires" | xargs)
+            [[ "$exc_branch" != "$BRANCH_NAME" ]] && continue
+            if [[ "$expires" < "$TODAY_UTC" ]]; then
+              echo "⚠️  Exception for '$BRANCH_NAME' expired on $expires — will check gate anyway"
+              EXCEPTION_EXPIRED=true
+            else
+              echo "⚠️  Quality Gate exception active for '$BRANCH_NAME' until $expires"
+              EXCEPTION_FOUND=true
+            fi
+            break
+          done < "$EXCEPTION_FILE"
+          if [[ "$EXCEPTION_FOUND" == "true" ]]; then
+            echo "✅ Skipping Quality Gate — exception is valid and approved"
+            echo "qg_status=EXCEPTED" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          ANALYSES_API="$SONAR_HOST_URL/api/project_analyses/search?project=$PROJECT_KEY&branch=$BRANCH_NAME"
+          ANALYSES=$(curl -s -u "$SONAR_TOKEN:" "$ANALYSES_API")
+          echo "$ANALYSES" | jq . || { echo "❌ SonarQube API failed or malformed JSON"; exit 1; }
+          LATEST_KEY=$(echo "$ANALYSES" | jq -r --arg today "$TODAY_UTC" '
+            .analyses[] | select(.date | startswith($today)) | .key
+          ' | head -n 1)
+          if [[ -z "$LATEST_KEY" || "$LATEST_KEY" == "null" ]]; then
+            echo "⚠️  No SonarQube analysis found for today on branch: $BRANCH_NAME"
+            echo "qg_status=NO_ANALYSIS" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "✅ Latest analysis key for today: $LATEST_KEY"
+          QG_API="$SONAR_HOST_URL/api/qualitygates/project_status?projectKey=$PROJECT_KEY&branch=$BRANCH_NAME"
+          QG_RES=$(curl -s -u "$SONAR_TOKEN:" "$QG_API")
+          QG_STATUS=$(echo "$QG_RES" | jq -r '.projectStatus.status // "UNKNOWN"')
+          echo "Quality Gate status: $QG_STATUS"
+          echo "qg_status=$QG_STATUS" >> "$GITHUB_OUTPUT"
+          if [[ "$QG_STATUS" == "OK" ]]; then
+            echo "✅ Quality Gate passed"
+            [[ "$EXCEPTION_EXPIRED" == "true" ]] && echo "⚠️  Expired exception still in $EXCEPTION_FILE — please remove it"
+            exit 0
+          elif [[ "$QG_STATUS" == "WARN" ]]; then
+            echo "⚠️  Quality Gate WARNING for branch: $BRANCH_NAME"
+            exit 0
+          elif [[ "$QG_STATUS" == "ERROR" ]]; then
+            echo "❌ Quality Gate FAILED on branch: $BRANCH_NAME"
+            echo "$QG_RES" | jq -r '
+              .projectStatus.conditions[]
+              | select(.status == "ERROR")
+              | "   - \(.metricKey): \(.actualValue) (threshold: \(.errorThreshold))"
+            '
+            echo ""
+            echo "   To add an exception: $BRANCH_NAME|<reason>|<YYYY-MM-DD>"
+            echo "   Raise a PR for @security-team approval."
+            exit 1
+          fi
+          echo "⚠️  Unknown Quality Gate status: $QG_STATUS"
+          exit 0
+  # ── Secret scan — source, .env files, patches/ ────────────────────────────
+  scan-secrets:
+    name: Security / Secrets
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Trivy
+        run: |
+          curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh \
+            | sh -s -- -b /usr/local/bin v0.69.3
+      - name: Scan platform package for secrets
+        run: |
+          if [[ "${{ github.event.inputs.platform }}" == "ANDROID" || "${{ github.event.inputs.platform }}" == "IOS" ]]; then
+            TARGET="packages/mobile"
+          else
+            TARGET="packages/web"
+          fi
+          echo "Scanning $TARGET for secrets..."
+          trivy fs \
+            --exit-code 1 \
+            --scanners secret \
+            --severity MEDIUM,HIGH,CRITICAL \
+            --ignore-unfixed \
+            --format table \
+            $TARGET
+      - name: Scan shared package for secrets
+        run: |
+          trivy fs \
+            --exit-code 1 \
+            --scanners secret \
+            --severity MEDIUM,HIGH,CRITICAL \
+            --ignore-unfixed \
+            --format table \
+            packages/shared
+      - name: Scan patches/ for secrets
+        run: |
+          trivy fs \
+            --exit-code 1 \
+            --scanners secret \
+            --severity MEDIUM,HIGH,CRITICAL \
+            --format table \
+            patches/
+  # ── Dependency vulnerability scan — reads yarn.lock + package.json directly ─
+  scan-dependencies:
+    name: Security / Dependencies
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Trivy
+        run: |
+          curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh \
+            | sh -s -- -b /usr/local/bin v0.69.3
+      - name: Scan platform package dependencies
+        run: |
+          if [[ "${{ github.event.inputs.platform }}" == "ANDROID" || "${{ github.event.inputs.platform }}" == "IOS" ]]; then
+            TARGET="packages/mobile"
+          else
+            TARGET="packages/web"
+          fi
+          echo "Scanning $TARGET dependencies..."
+          trivy fs \
+            --exit-code 1 \
+            --scanners vuln \
+            --severity MEDIUM,HIGH,CRITICAL \
+            --ignore-unfixed \
+            --ignorefile .trivyignore \
+            --format table \
+            $TARGET
+      - name: Scan shared package dependencies
+        run: |
+          trivy fs \
+            --exit-code 1 \
+            --scanners vuln \
+            --severity MEDIUM,HIGH,CRITICAL \
+            --ignore-unfixed \
+            --ignorefile .trivyignore \
+            --format table \
+            packages/shared
+  # ── License scan — reads package.json only, no build needed ───────────────
+  scan-licenses:
+    name: Security / Licenses
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Trivy
+        run: |
+          curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh \
+            | sh -s -- -b /usr/local/bin v0.69.3
+      - name: Scan platform package licenses
+        run: |
+          if [[ "${{ github.event.inputs.platform }}" == "ANDROID" || "${{ github.event.inputs.platform }}" == "IOS" ]]; then
+            TARGET="packages/mobile"
+          else
+            TARGET="packages/web"
+          fi
+          echo "Scanning $TARGET licenses..."
+          trivy fs \
+            --scanners license \
+            --exit-code 1 \
+            --severity HIGH,CRITICAL \
+            --ignorefile .trivyignore \
+            --format table \
+            $TARGET
+      - name: Scan shared package licenses
+        run: |
+          trivy fs \
+            --scanners license \
+            --exit-code 1 \
+            --severity HIGH,CRITICAL \
+            --ignorefile .trivyignore \
+            --format table \
+            packages/shared
+  # ── Gate: all parallel pre-build scans must pass before build starts ───────
+  pre-build-security-gate:
+    name: Security / Pre-Build Gate
+    needs:
+      - branch-check
+      - scan-codeql-sonar
+      - scan-secrets
+      - scan-dependencies
+      - scan-licenses
+    # always() so gate runs even when a scan fails or scan-docker-config is skipped
+    if: ${{ always() }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Evaluate all pre-build scan results
+        run: |
+          declare -A results=(
+            ["CodeQL + SonarQube"]="${{ needs.scan-codeql-sonar.result }}"
+            ["Secrets"]="${{ needs.scan-secrets.result }}"
+            ["Dependencies"]="${{ needs.scan-dependencies.result }}"
+            ["Licenses"]="${{ needs.scan-licenses.result }}"
+            ["Branch Check"]="${{ needs.branch-check.result }}"
+          )
+          failed=false
+          for name in "${!results[@]}"; do
+            r="${results[$name]}"
+            if [[ "$r" == "success" || "$r" == "skipped" ]]; then
+              echo "✅ $name: $r"
+            else
+              echo "❌ $name: $r"
+              failed=true
+            fi
+          done
+          if [[ "$failed" == "true" ]]; then
+            echo ""
+            echo "🚫 Build blocked — fix security issues above before proceeding."
+            exit 1
+          fi
+          echo ""
+          echo "✅ All pre-build security scans passed — proceeding to build."
+# ═══════════════════════════════════════════════════════════════════════════════
+# BUILD — ANDROID
+# SIT: no security gate dependency, builds immediately.
+# non-SIT: waits for pre-build-security-gate.
+# ═══════════════════════════════════════════════════════════════════════════════
+
+  build-android:
+    name: Build Android APK & AAB
+    environment: ${{ inputs.Environment }}
+    needs: [pre-build-security-gate]
+    if: |
+      always() &&
+      github.event.inputs.platform == 'ANDROID' &&
+      (
+        needs.pre-build-security-gate.result == 'success'
+      )
+    runs-on: ${{ github.event.inputs.AndroidRunner }}
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Generate .env files from secret
+        working-directory: packages/mobile
+        env:
+          ENV_CONFIGURATION: ${{ secrets.env_configuration }}
+        run: |
+          echo "$ENV_CONFIGURATION" > config.json
+          # Loop through each key in the JSON (dev, pentest, sit, etc.)
+          for env_name in $(echo "$ENV_CONFIGURATION" | jq -r 'keys[]'); do
+            output_file=".env.${env_name}"
+            echo "Generating $output_file..."
+            # Loop through each key-value pair inside the environment block
+            jq -r --arg env "$env_name" '
+              .[$env] | to_entries[] |
+              "\(.key)=\(.value)"
+            ' config.json > "$output_file"
+            echo "Created $output_file"
+          done
+          # Clean up temp file
+          rm config.json
+      - name: List generated files
+        working-directory: packages/mobile
+        run: ls -la .env.*
+
+      - name: Set dotenv file according to ${{ inputs.Environment }}
+        working-directory: packages/mobile
+        run: |
+          LOWERCASE_ENV=$(echo "${{ inputs.Environment }}" | tr '[:upper:]' '[:lower:]')
+          if [ "$LOWERCASE_ENV" = "prod-webserver" ]; then
+            LOWERCASE_ENV="prod"
+          fi
+          cp .env.$LOWERCASE_ENV .env
+          echo "Using .env.$LOWERCASE_ENV for the build."
+      - name: Install Java & Android SDK
+        uses: actions/setup-java@be666c2fcd27ec809703dec50e508c2fdc7f6654 # v5.2.0
+        with:
+          distribution: "zulu"
+          java-version: "17"
+
+      - name: Setup and install Node Dependencies
+        uses: ./.github/actions/setup-node-project
+        with:
+          enable-node-modules-cache: ${{ !(inputs.Environment == 'PROD' || inputs.Environment == 'PROD-Webserver') }}
+          node-version: '20.x'
+
+      - name: Print Versions
+        run: |
+          echo "Node.js: $(node -v)"
+          echo "NPM: $(npm -v)"
+          echo "Java: $(java -version)"
+          echo "Gradle: $(gradle -v)"
+          echo "Yarn: $(yarn -v)"
+      - name: Set Android Version and Package name
+        working-directory: packages/mobile
+        run: |
+          sed -i "s/versionCode [0-9]\+/versionCode ${{ github.run_number }}/" android/app/build.gradle
+          sed -i 's/versionName "[^"]*"/versionName "${{ github.event.inputs.AppVersion }}"/' android/app/build.gradle
+          sed -i "s/applicationId \".*\"/applicationId \"${{ vars.PACKAGE_NAME }}\"/" android/app/build.gradle
+      - name: Setup Fastlane
+        uses: ./.github/actions/setup-fastlane
+        with:
+          ruby-version: '3.3'
+
+      - name: Setup Signing Config
+        id: setup_signing
+        env:
+          SIGNING_KEY_BASE64: ${{ secrets.ANDROID_JKS_SIGNING_KEY_BASE64 }}
+        run: |
+          echo -n "$SIGNING_KEY_BASE64" | base64 -d > mib-nexgen.jks
+          SIGNING_KEYSTORE_PATH="$(pwd)/mib-nexgen.jks"
+          echo "Keystore decoded to: $SIGNING_KEYSTORE_PATH"
+          echo "SIGNING_KEYSTORE_PATH=$SIGNING_KEYSTORE_PATH" >> "$GITHUB_OUTPUT"
+      - name: Build Android app ${{ vars.PACKAGE_NAME }}
+        env:
+          SIGNING_KEYSTORE_PATH: ${{ steps.setup_signing.outputs.SIGNING_KEYSTORE_PATH }}
+          SIGNING_STORE_PASSWORD: ${{ secrets.ANDROID_STORE_PASSWORD }}
+          SIGNING_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          SIGNING_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        run: |
+          bundle exec fastlane android release_build
+      - name: Upload Android APK
+        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
+        with:
+          name: ReactNativeAndroidBuild-APK
+          path: packages/mobile/android/app/build/outputs/apk/
+          retention-days: 10
+          if-no-files-found: error
+
+      - name: Upload Android AAB
+        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
+        with:
+          name: ReactNativeAndroidBuild-AAB
+          path: packages/mobile/android/app/build/outputs/bundle/
+          retention-days: 10
+          if-no-files-found: error
+
+      - name: Cleanup Build Artifacts
+        run: |
+          rm -rf packages/mobile/android/app/build/
+          rm -rf packages/mobile/android/build/
+          rm -rf packages/mobile/android/app/.cxx/
+# ═══════════════════════════════════════════════════════════════════════════════
+# POST-BUILD SECURITY — ANDROID
+# Runs on Linux runner (no need for Android runner just for SBOM + attest).
+# Attests the AAB specifically — that is the artifact going to stores.
+# Skipped for SIT.
+# ═══════════════════════════════════════════════════════════════════════════════
+
+  scan-sbom-android:
+    name: Security / SBOM + Attest AAB & APK (Android)
+    needs: [build-android]
+    if: |
+      github.event.inputs.platform == 'ANDROID'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      attestations: write
+      id-token: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Download Android AAB artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: ReactNativeAndroidBuild-AAB
+          path: build-artifact/aab
+
+      - name: Download Android APK artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: ReactNativeAndroidBuild-APK
+          path: build-artifact/apk
+
+      - name: Find AAB file
+        id: find_aab
+        run: |
+          AAB_PATH=$(find build-artifact/aab -name "*.aab" | head -n 1)
+          if [ -z "$AAB_PATH" ]; then
+            echo "::error::No AAB file found in artifact"
+            exit 1
+          fi
+          AAB_ABS="$(pwd)/$AAB_PATH"
+          echo "Found AAB: $AAB_ABS"
+          echo "AAB_PATH=$AAB_ABS" >> "$GITHUB_OUTPUT"
+      - name: Find APK file
+        id: find_apk
+        run: |
+          APK_PATH=$(find build-artifact/apk -name "*.apk" | head -n 1)
+          if [ -z "$APK_PATH" ]; then
+            echo "::error::No APK file found in artifact"
+            exit 1
+          fi
+          APK_ABS="$(pwd)/$APK_PATH"
+          echo "Found APK: $APK_ABS"
+          echo "APK_PATH=$APK_ABS" >> "$GITHUB_OUTPUT"
+      - name: Install Trivy
+        run: |
+          curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh \
+            | sh -s -- -b /usr/local/bin v0.69.3
+      - name: Generate SBOM from source
+        run: |
+          trivy fs \
+            --scanners vuln \
+            --format cyclonedx \
+            --output sbom-android.cdx.json \
+            packages/mobile
+      - name: Scan SBOM for vulnerabilities
+        run: |
+          trivy sbom \
+            --exit-code 1 \
+            --scanners vuln \
+            --severity MEDIUM,HIGH,CRITICAL \
+            --ignore-unfixed \
+            --ignorefile .trivyignore \
+            --format table \
+            sbom-android.cdx.json
+      - name: Upload SBOM artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: SBOM-android
+          path: sbom-android.cdx.json
+
+      # AAB attestations
+      - name: Attest AAB provenance
+        uses: actions/attest-build-provenance@v1
+        with:
+          subject-path: ${{ steps.find_aab.outputs.AAB_PATH }}
+          push-to-registry: false
+
+      - name: Attest AAB SBOM
+        uses: actions/attest-sbom@v1
+        with:
+          subject-path: ${{ steps.find_aab.outputs.AAB_PATH }}
+          sbom-path: sbom-android.cdx.json
+          push-to-registry: false
+
+      # APK attestations
+      - name: Attest APK provenance
+        uses: actions/attest-build-provenance@v1
+        with:
+          subject-path: ${{ steps.find_apk.outputs.APK_PATH }}
+          push-to-registry: false
+
+      - name: Attest APK SBOM
+        uses: actions/attest-sbom@v1
+        with:
+          subject-path: ${{ steps.find_apk.outputs.APK_PATH }}
+          sbom-path: sbom-android.cdx.json
+          push-to-registry: false
+
+  verify-attestation-android:
+    name: Verify Android AAB & APK attestations
+    needs: scan-sbom-android
+    if: needs.scan-sbom-android.result == 'success'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      attestations: read
+
+    steps:
+      - name: Download AAB artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: ReactNativeAndroidBuild-AAB
+          path: build-artifact/aab
+
+      - name: Download APK artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: ReactNativeAndroidBuild-APK
+          path: build-artifact/apk
+
+      - name: Find AAB file
+        id: find_aab
+        run: |
+          AABPATH=$(find build-artifact/aab -name "*.aab" | head -n 1)
+          if [ -z "$AABPATH" ]; then
+            echo "::error::No AAB file found"
+            exit 1
+          fi
+          echo "AABPATH=$AABPATH" >> "$GITHUB_OUTPUT"
+      - name: Find APK file
+        id: find_apk
+        run: |
+          APKPATH=$(find build-artifact/apk -name "*.apk" | head -n 1)
+          if [ -z "$APKPATH" ]; then
+            echo "::error::No APK file found"
+            exit 1
+          fi
+          echo "APKPATH=$APKPATH" >> "$GITHUB_OUTPUT"
+      - name: Verify AAB provenance attestation
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh attestation verify "${{ steps.find_aab.outputs.AABPATH }}" \
+            --owner "${{ github.repository_owner }}" \
+            && echo "✓ AAB verified successfully: ${{ steps.find_aab.outputs.AABPATH }}"
+      - name: Verify APK provenance attestation
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh attestation verify "${{ steps.find_apk.outputs.APKPATH }}" \
+            --owner "${{ github.repository_owner }}" \
+            && echo "✓ APK verified successfully: ${{ steps.find_apk.outputs.APKPATH }}"
+  publish-android-artifacts-webserver:
+    name: Kony Webserver - Publish Android APK
+    needs: [build-android, scan-sbom-android, verify-attestation-android]
+    environment: ${{ inputs.Environment }}
+    if: |
+      always() &&
+      github.event.inputs.platform == 'ANDROID' &&
+      needs.build-android.result == 'success' &&
+      (needs.scan-sbom-android.result == 'success' || needs.scan-sbom-android.result == 'skipped') &&
+      (
+        github.event.inputs.Environment == 'SIT' ||
+        github.event.inputs.Environment == 'UAT' ||
+        github.event.inputs.Environment == 'PENTEST' ||
+        github.event.inputs.Environment == 'PREPROD'
+      )
+    runs-on: codebuild-mib2-frontend-deploy-runner-${{ github.run_id }}-${{ github.run_attempt }}
+    env:
+      SSH_HOST: ${{ secrets.WS_SERVER_HOST }}
+      SSH_PORT: ${{ secrets.WS_SERVER_PORT }}
+      SSH_USER: ${{ secrets.WS_SERVER_USER }}
+      SSH_PASS: ${{ secrets.WS_SERVER_PASSWORD }}
+      ANDROID_WS_SERVER_TARGET_PATH: ${{ vars.ANDROID_WS_SERVER_TARGET_PATH }}
+    steps:
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: ReactNativeAndroidBuild-APK
+          path: build-artifact
+      - name: Push APK via SCP
+        continue-on-error: true
+        run: |
+          APK_PATH=$(find build-artifact -type f -name '*.apk' | head -n1)
+          echo "Found APK at $APK_PATH"
+          DATE=$(date +%Y-%m_%d-%H:%M:%S)
+          sshpass -p "$SSH_PASS" \
+            ssh -o StrictHostKeyChecking=no -p "$SSH_PORT" "$SSH_USER@$SSH_HOST" \
+            "if [ -f '$ANDROID_WS_SERVER_TARGET_PATH' ]; then mv '$ANDROID_WS_SERVER_TARGET_PATH' '$ANDROID_WS_SERVER_TARGET_PATH.bkp-$DATE'; fi"
+          sshpass -p "$SSH_PASS" \
+            scp -o StrictHostKeyChecking=no \
+                -P "$SSH_PORT" \
+                "$APK_PATH" \
+                "$SSH_USER@$SSH_HOST:$ANDROID_WS_SERVER_TARGET_PATH"
+  it-grc-approval-android:
+    name: IT-GRC Approval (Android)
+    needs: [build-android, scan-sbom-android, verify-attestation-android]
+    if: |
+      github.event.inputs.platform == 'ANDROID' &&
+      github.event.inputs.Environment == 'PROD' &&
+      needs.build-android.result == 'success' &&
+      needs.scan-sbom-android.result == 'success'
+    environment: 'it-grc-approval'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Log Step
+        run: echo "IT-GRC approval gate passed for Android PROD build"
+
+  publish-android-playstore:
+    name: Deploy to Play Store
+    needs: [build-android, it-grc-approval-android]
+    if: ${{ inputs.PublishOnStore == true && inputs.Environment == 'PROD' }}
+    runs-on: ubuntu-24.04
+    environment: 'PROD-store'
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Download Android AAB artifact
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: ReactNativeAndroidBuild-AAB
+          path: build-artifact
+
+      - name: Setup Fastlane
+        uses: ./.github/actions/setup-fastlane
+        with:
+          ruby-version: '3.3'
+
+      - name: Setup Deployment Environment
+        id: setup_env
+        env:
+          ANDROID_PLAYSTORE_JSON_KEY_BASE64: ${{ secrets.ANDROID_PLAYSTORE_JSON_KEY_BASE64 }}
+        run: |
+          echo "$ANDROID_PLAYSTORE_JSON_KEY_BASE64" | base64 --decode > google-play-credentials.json
+          JSON_KEY_PATH="$(pwd)/google-play-credentials.json"
+          echo "ANDROID_PLAYSTORE_JSON_KEY=$JSON_KEY_PATH" >> "$GITHUB_OUTPUT"
+          AAB_RELATIVE_PATH=$(find build-artifact -name "*.aab" | head -n 1)
+          if [ -z "$AAB_RELATIVE_PATH" ]; then
+            echo "::error::No AAB file found in the downloaded artifact."
+            exit 1
+          fi
+          AAB_ABSOLUTE_PATH="$(pwd)/$AAB_RELATIVE_PATH"
+          echo "Found AAB at: $AAB_ABSOLUTE_PATH"
+          echo "ANDROID_AAB_PATH=$AAB_ABSOLUTE_PATH" >> "$GITHUB_OUTPUT"
+      - name: Deploy to Play Store via Fastlane
+        env:
+          ANDROID_AAB_PATH: ${{ steps.setup_env.outputs.ANDROID_AAB_PATH }}
+          ANDROID_PLAYSTORE_JSON_KEY: ${{ steps.setup_env.outputs.ANDROID_PLAYSTORE_JSON_KEY }}
+          ANDROID_PACKAGE_NAME: ${{ vars.PACKAGE_NAME }}
+        run: |
+          bundle exec fastlane android deploy_to_play_store
+  publish-android-huawei-app-gallery:
+    name: Deploy to Huawei App Gallery
+    needs: [build-android, it-grc-approval-android]
+    if: ${{ inputs.PublishOnStore == true && inputs.Environment == 'PROD' }}
+    runs-on: ubuntu-24.04
+    environment: 'PROD-store'
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Download Android AAB artifact
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: ReactNativeAndroidBuild-AAB
+          path: build-artifact
+
+      - name: Setup Fastlane
+        uses: ./.github/actions/setup-fastlane
+        with:
+          ruby-version: '3.3'
+
+      - name: Setup Deployment Environment
+        id: setup_env
+        run: |
+          AAB_RELATIVE_PATH=$(find build-artifact -name "*.aab" | head -n 1)
+          if [ -z "$AAB_RELATIVE_PATH" ]; then
+            echo "::error::No AAB file found in the downloaded artifact."
+            exit 1
+          fi
+          AAB_ABSOLUTE_PATH="$(pwd)/$AAB_RELATIVE_PATH"
+          echo "Found AAB at: $AAB_ABSOLUTE_PATH"
+          echo "ANDROID_AAB_PATH=$AAB_ABSOLUTE_PATH" >> "$GITHUB_OUTPUT"
+      - name: Deploy to Huawei App Gallery via Fastlane
+        env:
+          ANDROID_AAB_PATH: ${{ steps.setup_env.outputs.ANDROID_AAB_PATH }}
+          ANDROID_HUAWEI_CLIENT_ID: ${{ vars.ANDROID_HUAWEI_CLIENT_ID }}
+          ANDROID_HUAWEI_CLIENT_SECRET: ${{ secrets.ANDROID_HUAWEI_CLIENT_SECRET }}
+          ANDROID_PACKAGE_NAME: ${{ vars.PACKAGE_NAME }}
+        run: |
+          bundle exec fastlane android deploy_to_huawei_app_gallery
+# ═══════════════════════════════════════════════════════════════════════════════
+# BUILD — IOS
+# ═══════════════════════════════════════════════════════════════════════════════
+
+  build-ios:
+    name: Build & Distribute iOS App
+    needs: [pre-build-security-gate]
+    if: |
+      always() &&
+      github.event.inputs.platform == 'IOS' &&
+      (
+        needs.pre-build-security-gate.result == 'success'
+      )
+    environment: ${{ github.event.inputs.Environment }}
+    runs-on: ${{ github.event.inputs.IosRunner }}
+    env:
+      IOS_APP_VERSION: ${{ github.event.inputs.AppVersion }}
+      IOS_BUILD_NUMBER: ${{ github.run_number }}
+      IOS_XCODE_PATH: "/Applications/Xcode_26.0.1.app"
+      IOS_KEYCHAIN_NAME: ${{ vars.IOS_KEYCHAIN_NAME }}
+      IOS_PROVISIONING_SPECIFIER: ${{ vars.IOS_PROVISIONING_SPECIFIER }}
+      IOS_BUNDLE_IDENTIFIER: ${{ vars.IOS_PACKAGE_NAME }}
+      IOS_TEAM_ID: ${{ vars.IOS_TEAM_ID }}
+      IOS_NCE_BUNDLE_IDENTIFIER: ${{ vars.IOS_NCE_BUNDLE_IDENTIFIER }}
+      IOS_NCE_PROVISIONING_PROFILE_NAME: ${{ vars.IOS_NCE_PROVISIONING_PROFILE_NAME }}
+      IOS_NSE_BUNDLE_IDENTIFIER: ${{ vars.IOS_NSE_BUNDLE_IDENTIFIER }}
+      IOS_NSE_PROVISIONING_PROFILE_NAME: ${{ vars.IOS_NSE_PROVISIONING_PROFILE_NAME }}
+      IOS_WALLET_UI_BUNDLE_IDENTIFIER: ${{ vars.IOS_WALLET_UI_BUNDLE_IDENTIFIER }}
+      IOS_WALLET_UI_PROVISIONING_PROFILE_NAME: ${{ vars.IOS_WALLET_UI_PROVISIONING_PROFILE_NAME }}
+      IOS_WALLET_NON_UI_BUNDLE_IDENTIFIER: ${{ vars.IOS_WALLET_NON_UI_BUNDLE_IDENTIFIER }}
+      IOS_WALLET_NON_UI_PROVISIONING_PROFILE_NAME: ${{ vars.IOS_WALLET_NON_UI_PROVISIONING_PROFILE_NAME }}
+      IOS_CODE_SIGN_IDENTITY: ${{ vars.IOS_CODE_SIGN_IDENTITY }}
+      IOS_KEYCHAIN_PASS: ${{ secrets.IOS_KEYCHAIN_PASS }}
+      IOS_CERTIFICATE_PASS: ${{ secrets.IOS_CERTIFICATE_PASS }}
+      IOS_BUILD_CERTIFICATE_BASE64: ${{ secrets.IOS_BUILD_CERTIFICATE_BASE64 }}
+      IOS_BUILD_PROVISION_PROFILE_BASE64: ${{ secrets.IOS_BUILD_PROVISION_PROFILE_BASE64 }}
+      IOS_NCE_PROVISION_PROFILE_BASE64: ${{ secrets.IOS_NCE_PROVISION_PROFILE_BASE64 }}
+      IOS_NSE_PROVISION_PROFILE_BASE64: ${{ secrets.IOS_NSE_PROVISION_PROFILE_BASE64 }}
+      IOS_WALLET_UI_PROVISION_PROFILE_BASE64: ${{ secrets.IOS_WALLET_UI_PROVISION_PROFILE_BASE64 }}
+      IOS_WALLET_NON_UI_PROVISION_PROFILE_BASE64: ${{ secrets.IOS_WALLET_NON_UI_PROVISION_PROFILE_BASE64 }}
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Setup Fastlane
+        uses: ./.github/actions/setup-fastlane
+        with:
+          ruby-version: '3.3'
+
+      - name: Decode and import iOS Certificates and Provisioning Profiles
+        run: |
+          mkdir ios-certs
+          echo "${{ env.IOS_BUILD_CERTIFICATE_BASE64 }}"          | base64 --decode > ios-certs/mib-cert.p12
+          echo "${{ env.IOS_BUILD_PROVISION_PROFILE_BASE64 }}"    | base64 --decode > ios-certs/mib.mobileprovision
+          echo "${{ env.IOS_NSE_PROVISION_PROFILE_BASE64 }}"      | base64 --decode > ios-certs/nse.mobileprovision
+          echo "${{ env.IOS_NCE_PROVISION_PROFILE_BASE64 }}"      | base64 --decode > ios-certs/nce.mobileprovision
+          echo "${{ env.IOS_WALLET_UI_PROVISION_PROFILE_BASE64 }}"     | base64 --decode > ios-certs/wallet-ui.mobileprovision
+          echo "${{ env.IOS_WALLET_NON_UI_PROVISION_PROFILE_BASE64 }}" | base64 --decode > ios-certs/wallet-non-ui.mobileprovision
+          # Paths for later steps via GITHUB_ENV and for Fastlane in this step (GITHUB_ENV is not applied until the next step).
+          IOS_CERTIFICATE_PATH="$(pwd)/$(find ios-certs -name 'mib-cert.p12' | head -n1)"
+          IOS_PROVISIONING_PROFILE_PATH="$(pwd)/$(find ios-certs -name 'mib.mobileprovision' | head -n1)"
+          IOS_NSE_PROVISIONING_PROFILE_PATH="$(pwd)/$(find ios-certs -name 'nse.mobileprovision' | head -n1)"
+          IOS_NCE_PROVISIONING_PROFILE_PATH="$(pwd)/$(find ios-certs -name 'nce.mobileprovision' | head -n1)"
+          IOS_WALLET_UI_PROVISIONING_PROFILE_PATH="$(pwd)/$(find ios-certs -name 'wallet-ui.mobileprovision' | head -n1)"
+          IOS_WALLET_NON_UI_PROVISIONING_PROFILE_PATH="$(pwd)/$(find ios-certs -name 'wallet-non-ui.mobileprovision' | head -n1)"
+          {
+            echo "IOS_CERTIFICATE_PATH=$IOS_CERTIFICATE_PATH"
+            echo "IOS_PROVISIONING_PROFILE_PATH=$IOS_PROVISIONING_PROFILE_PATH"
+            echo "IOS_NSE_PROVISIONING_PROFILE_PATH=$IOS_NSE_PROVISIONING_PROFILE_PATH"
+            echo "IOS_NCE_PROVISIONING_PROFILE_PATH=$IOS_NCE_PROVISIONING_PROFILE_PATH"
+            echo "IOS_WALLET_UI_PROVISIONING_PROFILE_PATH=$IOS_WALLET_UI_PROVISIONING_PROFILE_PATH"
+            echo "IOS_WALLET_NON_UI_PROVISIONING_PROFILE_PATH=$IOS_WALLET_NON_UI_PROVISIONING_PROFILE_PATH"
+          } >> "$GITHUB_ENV"
+          export IOS_CERTIFICATE_PATH IOS_PROVISIONING_PROFILE_PATH IOS_NSE_PROVISIONING_PROFILE_PATH \
+            IOS_NCE_PROVISIONING_PROFILE_PATH IOS_WALLET_UI_PROVISIONING_PROFILE_PATH IOS_WALLET_NON_UI_PROVISIONING_PROFILE_PATH
+          echo "\n[DEBUG] Listing ios-certs directory and showing provisioning profile file info..."
+          ls -lh ios-certs/
+          echo "[DEBUG] IOS_PROVISIONING_PROFILE_PATH: $(pwd)/ios-certs/mib.mobileprovision"
+          echo "[DEBUG] File details:"
+          ls -lh $(pwd)/ios-certs/mib.mobileprovision || true
+          echo "[DEBUG] First 10 lines of provisioning profile:"
+          head -10 $(pwd)/ios-certs/mib.mobileprovision || true
+          bundle exec fastlane ios keychain_setup
+      - name: Reset Xcode project signing configuration
+        run: bundle exec fastlane ios reset_signing_config
+
+      - name: Validate Xcode project configuration
+        if: ${{ inputs.EnableIosTargetValidation == true }}
+        run: bundle exec fastlane ios validate_app_targets
+
+      - name: Generate .env files from secret
+        working-directory: packages/mobile
+        env:
+          ENV_CONFIGURATION: ${{ secrets.env_configuration }}
+        run: |
+          echo "$ENV_CONFIGURATION" > config.json
+          # Loop through each key in the JSON (dev, pentest, sit, etc.)
+          for env_name in $(echo "$ENV_CONFIGURATION" | jq -r 'keys[]'); do
+            output_file=".env.${env_name}"
+            echo "Generating $output_file..."
+            # Loop through each key-value pair inside the environment block
+            jq -r --arg env "$env_name" '
+              .[$env] | to_entries[] |
+              "\(.key)=\(.value)"
+            ' config.json > "$output_file"
+            echo "Created $output_file"
+          done
+          # Clean up temp file
+          rm config.json
+      - name: List generated files
+        working-directory: packages/mobile
+        run: ls -la .env.*
+
+      - name: Set dotenv file according to ${{ inputs.Environment }}
+        working-directory: packages/mobile
+        run: |
+          LOWERCASE_ENV=$(echo "${{ inputs.Environment }}" | tr '[:upper:]' '[:lower:]')
+          if [ "$LOWERCASE_ENV" = "prod-webserver" ]; then
+            LOWERCASE_ENV="prod"
+          fi
+          cp .env.$LOWERCASE_ENV .env
+          echo "Using .env.$LOWERCASE_ENV for the build."
+      - name: Setup and install Node Dependencies
+        uses: ./.github/actions/setup-node-project
+        with:
+          enable-node-modules-cache: ${{ !(inputs.Environment == 'PROD' || inputs.Environment == 'PROD-Webserver') }}
+          node-version: '20.x'
+
+      - name: Cache iOS dependencies
+        uses: actions/cache@668228422ae6a00e4ad889ee87cd7109ec5666a7 # v5.0.4
+        with:
+          path: |
+            ~/.bundle
+            ~/.cocoapods
+            ~/Library/Caches/CocoaPods
+            ~/Library/Developer/Xcode/DerivedData
+            ./ios/Pods
+          key: ios-dependencies-${{ runner.os }}
+          restore-keys: |
+            ios-dependencies-${{ runner.os }}
+      - name: Install Pods and prepare iOS Version
+        run: bundle exec fastlane ios install_dependencies_and_prepare_version
+
+      - name: Archive and Export iOS App
+        run: bundle exec fastlane ios archive_and_export_ipa
+
+      - name: Upload Gym Log
+        if: always()
+        continue-on-error: true
+        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
+        with:
+          name: GymLog
+          path: /Users/runner/Library/Logs/gym/*.log
+          retention-days: 4
+
+      - name: Upload iOS IPA artifact
+        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
+        with:
+          name: ReactNativeIOSBuild
+          path: packages/mobile/ios/build/export
+          retention-days: 10
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# POST-BUILD SECURITY — IOS
+# Runs on Linux runner — no need to spend macOS runner minutes on SBOM/attest.
+# Attests the IPA specifically — that is the artifact going to Testflight.
+# Skipped for SIT.
+# ═══════════════════════════════════════════════════════════════════════════════
+
+  scan-sbom-ios:
+    name: Security / SBOM + Attest IPA (iOS)
+    needs: [build-ios]
+    if: |
+      github.event.inputs.platform == 'IOS'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      attestations: write
+      id-token: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Download iOS IPA artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: ReactNativeIOSBuild
+          path: build-artifact
+
+      - name: Find IPA file
+        id: find_ipa
+        run: |
+          IPA_PATH=$(find build-artifact -name "*.ipa" | head -n 1)
+          if [ -z "$IPA_PATH" ]; then
+            echo "::error::No IPA file found in artifact"
+            exit 1
+          fi
+          IPA_ABS="$(pwd)/$IPA_PATH"
+          echo "Found IPA: $IPA_ABS"
+          echo "IPA_PATH=$IPA_ABS" >> "$GITHUB_OUTPUT"
+      - name: Install Trivy
+        run: |
+          curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh \
+            | sh -s -- -b /usr/local/bin v0.69.3
+      - name: Generate SBOM from source
+        run: |
+          trivy fs \
+            --scanners vuln \
+            --format cyclonedx \
+            --output sbom-ios.cdx.json \
+            packages/mobile
+      - name: Scan SBOM for vulnerabilities
+        run: |
+          trivy sbom \
+            --exit-code 1 \
+            --scanners vuln \
+            --severity MEDIUM,HIGH,CRITICAL \
+            --ignore-unfixed \
+            --ignorefile .trivyignore \
+            --format table \
+            sbom-ios.cdx.json
+      - name: Upload SBOM artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: SBOM-ios
+          path: sbom-ios.cdx.json
+
+      - name: Attest IPA provenance
+        uses: actions/attest-build-provenance@v1
+        with:
+          subject-path: ${{ steps.find_ipa.outputs.IPA_PATH }}
+          push-to-registry: false
+
+      - name: Attest IPA SBOM
+        uses: actions/attest-sbom@v1
+        with:
+          subject-path: ${{ steps.find_ipa.outputs.IPA_PATH }}
+          sbom-path: sbom-ios.cdx.json
+          push-to-registry: false
+
+  verify-attestation-ios:
+    name: Verify iOS IPA attestation
+    needs: scan-sbom-ios
+    if: needs.scan-sbom-ios.result == 'success'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      attestations: read
+
+    steps:
+      - name: Download IPA artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: ReactNativeIOSBuild
+          path: build-artifact
+
+      - name: Find IPA file
+        id: find_ipa
+        run: |
+          IPAPATH=$(find build-artifact -name "*.ipa" | head -n 1)
+          if [ -z "$IPAPATH" ]; then
+            echo "::error::No IPA file found"
+            exit 1
+          fi
+          echo "IPAPATH=$IPAPATH" >> "$GITHUB_OUTPUT"
+      - name: Verify IPA provenance attestation
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh attestation verify "${{ steps.find_ipa.outputs.IPAPATH }}" \
+            --owner "${{ github.repository_owner }}" \
+          && echo "✓ IPA verified successfully: ${{ steps.find_ipa.outputs.IPAPATH }}"
+  publish-ios-artifacts-webserver:
+    name: Kony Webserver - Publish iOS IPA
+    needs: [build-ios, scan-sbom-ios, verify-attestation-ios]
+    if: |
+      always() &&
+      github.event.inputs.platform == 'IOS' &&
+      needs.build-ios.result == 'success' &&
+      (needs.scan-sbom-ios.result == 'success' || needs.scan-sbom-ios.result == 'skipped') &&
+      (
+        github.event.inputs.Environment == 'SIT' ||
+        github.event.inputs.Environment == 'UAT' ||
+        github.event.inputs.Environment == 'PENTEST' ||
+        github.event.inputs.Environment == 'PREPROD'
+      )
+    environment: ${{ inputs.Environment }}
+    runs-on: codebuild-mib2-frontend-deploy-runner-${{ github.run_id }}-${{ github.run_attempt }}
+    continue-on-error: true
+    env:
+      SSH_HOST: ${{ secrets.WS_SERVER_HOST }}
+      SSH_PORT: ${{ secrets.WS_SERVER_PORT }}
+      SSH_USER: ${{ secrets.WS_SERVER_USER }}
+      SSH_PASS: ${{ secrets.WS_SERVER_PASSWORD }}
+      IOS_WS_SERVER_REMOTE_PATH: ${{ vars.IOS_WS_SERVER_TARGET_PATH }}
+    steps:
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: ReactNativeIOSBuild
+          path: build-artifact
+
+      - name: Push IPA via SCP
+        run: |
+          IPA_PATH=$(find build-artifact -type f -name '*.ipa' | head -n1)
+          echo "Found IPA at $IPA_PATH"
+          DATE=$(date +%Y-%m_%d-%H:%M:%S)
+          sshpass -p "$SSH_PASS" \
+            ssh -o StrictHostKeyChecking=no -p "$SSH_PORT" "$SSH_USER@$SSH_HOST" \
+            "if [ -f '$IOS_WS_SERVER_REMOTE_PATH' ]; then mv '$IOS_WS_SERVER_REMOTE_PATH' '$IOS_WS_SERVER_REMOTE_PATH.bkp-$DATE'; fi"
+          sshpass -p "$SSH_PASS" \
+            scp -o StrictHostKeyChecking=no \
+                -P "$SSH_PORT" \
+                "$IPA_PATH" \
+                "$SSH_USER@$SSH_HOST:$IOS_WS_SERVER_REMOTE_PATH"
+  it-grc-approval-ios:
+    name: IT-GRC Approval (iOS)
+    needs: [build-ios, scan-sbom-ios, verify-attestation-ios]
+    if: |
+      github.event.inputs.platform == 'IOS' &&
+      github.event.inputs.Environment == 'PROD' &&
+      needs.build-ios.result == 'success' &&
+      needs.scan-sbom-ios.result == 'success'
+    environment: 'it-grc-approval'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Log Step
+        run: echo "IT-GRC approval gate passed for iOS PROD build"
+
+  validate-ipa:
+    name: Validate iOS IPA for App Store
+    needs: [build-ios, scan-sbom-ios]
+    if: |
+      github.event.inputs.PublishOnStore == true &&
+      github.event.inputs.Environment == 'PROD' &&
+      needs.build-ios.result == 'success' &&
+      needs.scan-sbom-ios.result == 'success'
+    runs-on: macos-15
+    env:
+      IOS_APP_STORE_KEY_ID: ${{ vars.IOS_APP_STORE_KEY_ID }}
+      IOS_APP_STORE_ISSUER_ID: ${{ vars.IOS_APP_STORE_ISSUER_ID }}
+      IOS_APP_STORE_API_KEY_P8: ${{ secrets.IOS_APP_STORE_API_KEY_P8 }}
+    steps:
+      - name: Download iOS IPA artifact
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: ReactNativeIOSBuild
+
+      - name: Validate IPA against App Store
+        run: |
+          mkdir ~/private_keys
+          printf "%s" "${IOS_APP_STORE_API_KEY_P8}" > ~/private_keys/AuthKey_${IOS_APP_STORE_KEY_ID}.p8
+          xcrun altool --validate-app -t ios \
+            --apiKey $IOS_APP_STORE_KEY_ID \
+            --apiIssuer $IOS_APP_STORE_ISSUER_ID \
+            -f ADCBMIBAppFrontEnd.ipa
+  publish-ios-testflight:
+    name: Deploy to Testflight
+    needs: [build-ios, it-grc-approval-ios, validate-ipa]
+    if: ${{ inputs.PublishOnStore == true && inputs.Environment == 'PROD' }}
+    runs-on: macos-15
+    environment: 'PROD-store'
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: ReactNativeIOSBuild
+          path: build-artifact
+
+      - name: Setup Fastlane
+        uses: ./.github/actions/setup-fastlane
+        with:
+          ruby-version: '3.3'
+
+      - name: Publish to Testflight via Fastlane
+        env:
+          IOS_BUNDLE_IDENTIFIER: ${{ vars.IOS_PACKAGE_NAME }}
+          IOS_APP_STORE_KEY_ID: ${{ vars.IOS_APP_STORE_KEY_ID }}
+          IOS_APP_STORE_ISSUER_ID: ${{ vars.IOS_APP_STORE_ISSUER_ID }}
+          IOS_APP_STORE_API_KEY_P8: ${{ secrets.IOS_APP_STORE_API_KEY_P8 }}
+        run: |
+          IPA_RELATIVE_PATH=$(find build-artifact -name "*.ipa" | head -n 1)
+          if [ -z "$IPA_RELATIVE_PATH" ]; then
+            echo "::error::No IPA file found in the downloaded artifact."
+            exit 1
+          fi
+          export IPA_ABSOLUTE_PATH="$(pwd)/$IPA_RELATIVE_PATH"
+          echo "Found IPA at: $IPA_ABSOLUTE_PATH"
+          bundle exec fastlane ios deploy_testflight
+# ═══════════════════════════════════════════════════════════════════════════════
+# BUILD — WEB
+# ═══════════════════════════════════════════════════════════════════════════════
+
+  build-web-artifact:
+    name: Build Web App Artifact
+    needs: [pre-build-security-gate]
+    if: |
+      always() &&
+      github.event.inputs.platform == 'WEB' &&
+      (
+        needs.pre-build-security-gate.result == 'success'
+      )
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Set up Node.js
+        uses: actions/setup-node@53b83947a5a98c8d113130e565377fae1a50d02f # v6.3.0
+        with:
+          node-version: 20.x
+
+      - name: Update Web App Version
+        run: |
+          cd packages/web
+          NEW_VERSION=${{ github.event.inputs.AppVersion }}
+          jq --arg ver "$NEW_VERSION" '.version = $ver' package.json > temp.json && mv temp.json package.json
+          echo "Updated package.json version to $NEW_VERSION"
+      - name: Print Dockerfile Content
+        run: cat Dockerfile
+
+      - name: Build Docker Image
+        run: |
+          docker build -t retailib-web:${{ github.event.inputs.AppVersion }} .
+          docker save retailib-web:${{ github.event.inputs.AppVersion }} \
+            -o retailib-web-${{ github.event.inputs.AppVersion }}.tar
+      - name: Upload Docker Image Artifact
+        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
+        with:
+          name: retailib-web-image
+          path: retailib-web-${{ github.event.inputs.AppVersion }}.tar
+          retention-days: 5
+          if-no-files-found: error
+          overwrite: true
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# WEB PUBLISH & DEPLOY
+# No post-build SBOM scan for web — pre-build scans (secrets, deps, licenses,
+# docker config) cover the web surface area before the Docker image is built.
+# push-web-ecr proceeds directly after build-web-artifact.
+# ═══════════════════════════════════════════════════════════════════════════════
+
+  push-web-ecr:
+    name: Push Web Image to ECR
+    needs: [build-web-artifact]
+    runs-on: codebuild-mib2-fe-runner-agent-${{ github.run_id }}-${{ github.run_attempt }}
+    steps:
+      - name: Download Built Image Artifact
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: retailib-web-image
+          path: .
+
+      - name: Assume AWS Role and Export Credentials
+        id: assume_role
+        run: |
+          echo "Assuming role: arn:aws:iam::609543642903:role/EngineeringAccountAccessRole"
+          CREDS_JSON=$(aws sts assume-role \
+            --role-arn arn:aws:iam::609543642903:role/EngineeringAccountAccessRole \
+            --role-session-name github-actions-session)
+          echo "AWS_ACCESS_KEY_ID=$(echo $CREDS_JSON | jq -r .Credentials.AccessKeyId)"         >> $GITHUB_ENV
+          echo "AWS_SECRET_ACCESS_KEY=$(echo $CREDS_JSON | jq -r .Credentials.SecretAccessKey)" >> $GITHUB_ENV
+          echo "AWS_SESSION_TOKEN=$(echo $CREDS_JSON | jq -r .Credentials.SessionToken)"        >> $GITHUB_ENV
+      - name: Login to ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@f2e9fc6c2b355c1890b65e6f6f0e2ac3e6e22f78 # v2.1.2
+
+      - name: Load Docker Image
+        run: |
+          docker load -i retailib-web-${{ github.event.inputs.AppVersion }}.tar
+      - name: Push Docker Image to ECR
+        env:
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+        run: |
+          if aws ecr describe-images \
+            --repository-name mib2-0-dev \
+            --image-ids imageTag=retailib-web-${{ github.event.inputs.AppVersion }} \
+            --region me-central-1 > /dev/null 2>&1; then
+              echo "ECR image already exists, skipping push"
+          else
+              docker tag retailib-web:${{ github.event.inputs.AppVersion }} \
+                $ECR_REGISTRY/mib2-0-dev:retailib-web-${{ github.event.inputs.AppVersion }}
+              docker push \
+                $ECR_REGISTRY/mib2-0-dev:retailib-web-${{ github.event.inputs.AppVersion }}
+          fi
+          echo "$ECR_REGISTRY/mib2-0-dev:retailib-web-${{ github.event.inputs.AppVersion }}" > image_ref.txt
+      - name: Upload image reference
+        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
+        with:
+          name: ReactNativeWebBuild
+          path: image_ref.txt
+          retention-days: 10
+          if-no-files-found: error
+          overwrite: true
+
+  deploy-SIT:
+    needs: [push-web-ecr]
+    if: ${{ github.event.inputs.Environment == 'SIT' }}
+    uses: ./.github/workflows/deploy.yml
+    with:
+      environment: SIT
