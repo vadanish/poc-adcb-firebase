@@ -97,3 +97,47 @@
 │ Managed by      │ │ Managed by      │ │ Managed by      │
 │ same modules    │ │ same modules    │ │ same modules    │
 └─────────────────┘ └─────────────────┘ └─────────────────┘
+
+
+Future State (Azure & On-Prem)
+
+TERRAFORM PLATFORM
+                            │
+          ┌─────────────────┼─────────────────┐
+          │                 │                 │
+          ▼                 ▼                 ▼
+
+      AWS CLOUD        AZURE CLOUD       ON-PREM
+
+   modules/aws/*     modules/azure/*   modules/vmware/*
+          │                 │                 │
+          └────────── Same Governance ───────┘
+
+            Tags
+            Security
+            CI/CD
+            State Management
+            Standards
+
+
+Executive Message for Manager
+Goal:
+Build a centralized Terraform Platform managed by DevOps
+within the Engineering Account.
+
+Benefits:
+✓ Single source of truth
+✓ Infrastructure standardization
+✓ Security & governance enforcement
+✓ Reusable modules
+✓ Faster onboarding of new products
+✓ Reduced configuration drift
+✓ GitHub-driven approvals
+✓ Multi-cloud readiness (AWS/Azure/On-Prem)
+
+Current Scope:
+Product-A migration (SIT/UAT/PROD)
+
+Future Scope:
+Product-B ... Product-N onboarding using
+the same approved Terraform modules.
