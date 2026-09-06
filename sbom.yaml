@@ -1,0 +1,89 @@
+name: DevSecOps Security Scan
+
+on:
+  push:
+    branches:
+      - main
+      - develop
+
+  pull_request:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+jobs:
+  security:
+    runs-on: ubuntu-latest
+
+    steps:
+
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Setup Java
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: "17"
+          cache: maven
+
+      - name: Build
+        run: |
+          mvn clean verify
+
+      # -------------------------
+      # OWASP Dependency Check
+      # -------------------------
+      - name: OWASP Dependency Check
+        run: |
+          mvn org.owasp:dependency-check-maven:check \
+            -DfailBuildOnCVSS=7
+
+      # -------------------------
+      # Generate SBOM
+      # -------------------------
+      - name: Generate CycloneDX SBOM
+        run: |
+          mvn org.cyclonedx:cyclonedx-maven-plugin:makeAggregateBom
+
+      # -------------------------
+      # Store SBOM
+      # -------------------------
+      - name: Upload SBOM
+        uses: actions/upload-artifact@v4
+        with:
+          name: sbom
+          path: target/bom.json
+
+      # -------------------------
+      # Trivy Source Scan
+      # -------------------------
+      - name: Trivy Dependency Scan
+        uses: aquasecurity/trivy-action@master
+        with:
+          scan-type: fs
+          scan-ref: .
+          severity: HIGH,CRITICAL
+          ignore-unfixed: true
+          exit-code: "1"
+
+      # -------------------------
+      # Build Docker Image
+      # -------------------------
+      - name: Build Docker Image
+        run: |
+          docker build \
+            -t myapp:${{ github.sha }} .
+
+      # -------------------------
+      # Trivy Container Scan
+      # -------------------------
+      - name: Trivy Container Scan
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: myapp:${{ github.sha }}
+          severity: HIGH,CRITICAL
+          ignore-unfixed: true
+          exit-code: "1"
